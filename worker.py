@@ -83,7 +83,7 @@ def interpolate_frames(
 
     # Import RIFE model
     sys.path.insert(0, "/workspace/RIFE")
-    from model.RIFE_HDv3 import Model as RIFEModel
+    from model.RIFE import Model as RIFEModel
 
     print("Loading RIFE model...")
     model = RIFEModel()
@@ -122,7 +122,7 @@ def interpolate_frames(
         with torch.no_grad():
             for j in range(1, multiplier):
                 t = j / multiplier
-                mid = model.inference(img0, img1, t)
+                mid = model.inference(img0, img1, timestep=t)
                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)
                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
 
