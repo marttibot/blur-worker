@@ -25,7 +25,8 @@ RUN git clone https://github.com/hzwer/RIFE.git /workspace/RIFE
 
 # Download pretrained weights from Huggingface
 RUN wget -q "https://huggingface.co/hzwer/RIFE/resolve/main/RIFE_train_log.zip" -O /tmp/RIFE_train_log.zip && \
-    unzip /tmp/RIFE_train_log.zip -d /workspace/RIFE/train_log && \
+    unzip /tmp/RIFE_train_log.zip -d /workspace/RIFE/ && \
+    mv /workspace/RIFE/RIFE_train_log /workspace/RIFE/train_log && \
     rm /tmp/RIFE_train_log.zip
 
 # Verify model loads
