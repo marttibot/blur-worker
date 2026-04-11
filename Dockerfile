@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir \
     tqdm \
     scipy \
     einops \
+    boto3 \
     gdown
 
 WORKDIR /workspace

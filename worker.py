@@ -215,25 +215,10 @@ def handler(event: dict) -> dict:
             print(f"Encoding at {output_fps:.0f} fps...")
             blend_and_encode(interp_dir, output_path, config, output_fps)
 
-            # Upload result to R2 via app API
-            output_key = f"jobs/{job_id}/output.mp4"
-            base_url = job_input.get("baseUrl", "https://blur.soldegennn.workers.dev")
-            print(f"Uploading output to R2 via {base_url}/api/upload...")
-            with open(output_path, "rb") as f:
-                upload_resp = requests.put(
-                    f"{base_url}/api/upload",
-                    files={"file": ("output.mp4", f, "video/mp4")},
-                    data={"key": output_key},
-                    timeout=300
-                )
-                if not upload_resp.ok:
-                    print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
-                    raise ValueError(f"Upload to R2 failed: {upload_resp.status_code}")
-                print(f"Upload complete: {output_key}")
-
             return {
                 "status": "completed",
-                "outputPath": output_key,
+                "outputKey": f"jobs/{job_id}/output.mp4",
+                "outputBase64": "data:video/mp4;base64," + base64.b64encode(open(output_path, "rb").read()).decode("utf-8"),
                 "duration": duration,
                 "outputFps": output_fps,
             }
