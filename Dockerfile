@@ -14,8 +14,6 @@ RUN pip install --no-cache-dir \
     Pillow \
     requests \
     runpod \
-    torch \
-    torchvision \
     tqdm \
     scipy \
     einops
