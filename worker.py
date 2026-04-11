@@ -74,7 +74,10 @@ def handler(event: dict) -> dict:
         saturation = float(config.get("saturation", 1.0))
         contrast = float(config.get("contrast", 1.0))
         codec = str(config.get("codec", "h265")).lower()
-        target_output_fps = int(config.get("outputFps", 60))
+        try:
+            target_output_fps = int(config.get("outputFps", 60))
+        except (ValueError, TypeError):
+            target_output_fps = 60
 
         work_dir = tempfile.mkdtemp()
 
