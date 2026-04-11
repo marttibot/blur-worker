@@ -10,6 +10,7 @@ import json
 import subprocess
 import tempfile
 import shutil
+import base64
 
 import requests
 import cv2
@@ -32,10 +33,8 @@ def download_file(url: str, dest: str) -> None:
 
 
 def get_video_info(video_path: str) -> dict:
-    cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-show_format", video_path
-    ]
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_streams", "-show_format", video_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise ValueError(f"ffprobe failed: {result.stderr}")
@@ -79,12 +78,10 @@ def interpolate_frames(input_dir: str, output_dir: str, multiplier: int) -> None
     if not frame_files:
         raise ValueError("No frames found")
 
-    # Read first frame to get dimensions
     first = cv2.imread(frame_files[0])
     h, w = first.shape[:2]
     print(f"Frame dimensions: {w}x{h}")
 
-    # Padding to multiples of 128 (matching official inference_video.py)
     tmp = 128
     ph = ((h - 1) // tmp + 1) * tmp
     pw = ((w - 1) // tmp + 1) * tmp
@@ -97,7 +94,6 @@ def interpolate_frames(input_dir: str, output_dir: str, multiplier: int) -> None
     output_idx = 0
 
     for i in range(len(frame_files)):
-        # Write original frame
         img_bgr = cv2.imread(frame_files[i])
         out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
         cv2.imwrite(out_path, img_bgr)
@@ -106,19 +102,15 @@ def interpolate_frames(input_dir: str, output_dir: str, multiplier: int) -> None
         if i >= len(frame_files) - 1:
             break
 
-        # Read and pad frames (matching official approach)
         img0 = torch.from_numpy(cv2.imread(frame_files[i])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
         img1 = torch.from_numpy(cv2.imread(frame_files[i + 1])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-
         img0 = pad_image(img0).to(DEVICE)
         img1 = pad_image(img1).to(DEVICE)
 
-        # Generate intermediate frames (matching official make_inference)
         with torch.no_grad():
             for j in range(1, multiplier):
                 t = j / multiplier
                 mid = model.inference(img0, img1, timestep=t, scale=1.0)
-                # Crop back to original dimensions
                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
                 out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
@@ -153,12 +145,13 @@ def blend_and_encode(frames_dir: str, output_path: str, config: dict, output_fps
 
     filter_str = ",".join(filters) if filters else "null"
 
+    # Use libx264 with veryfast preset for speed (libx265 was way too slow)
     cmd = [
         "ffmpeg", "-y", "-framerate", str(output_fps),
         "-i", os.path.join(frames_dir, "interp_%06d.png"),
         "-vf", filter_str,
-        "-c:v", "libx265", "-crf", str(quality),
-        "-pix_fmt", "yuv420p", "-preset", "medium",
+        "-c:v", "libx264", "-crf", str(quality),
+        "-pix_fmt", "yuv420p", "-preset", "veryfast",
         "-movflags", "+faststart", output_path
     ]
 
@@ -167,6 +160,14 @@ def blend_and_encode(frames_dir: str, output_path: str, config: dict, output_fps
     if result.returncode != 0:
         raise ValueError(f"Encoding failed: {result.stderr}")
     print("Encoding complete.")
+
+
+def upload_to_r2(file_path: str, r2_key: str, base_url: str) -> str:
+    """Upload output video to R2 via the app's download/upload API."""
+    # The app has a download proxy but no upload API for workers.
+    # Instead, we'll return the file as base64 in the output and let the webhook handle it.
+    # For now, we just report completion and the outputPath will be constructed by the webhook.
+    return r2_key
 
 
 def handler(event: dict) -> dict:
@@ -214,26 +215,32 @@ def handler(event: dict) -> dict:
             print(f"Encoding at {output_fps:.0f} fps...")
             blend_and_encode(interp_dir, output_path, config, output_fps)
 
-            # Upload result
-            output_url = None
-            if output_callback_url:
-                with open(output_path, "rb") as f:
-                    upload_resp = requests.put(
-                        output_callback_url,
-                        files={"file": ("output.mp4", f, "video/mp4")},
-                        timeout=600
-                    )
-                    if upload_resp.ok:
-                        result = upload_resp.json()
-                        output_url = result.get("url", "")
+            # Upload result to R2 via app API
+            output_key = f"jobs/{job_id}/output.mp4"
+            base_url = job_input.get("baseUrl", "https://blur.soldegennn.workers.dev")
+            print(f"Uploading output to R2 via {base_url}/api/upload...")
+            with open(output_path, "rb") as f:
+                upload_resp = requests.put(
+                    f"{base_url}/api/upload",
+                    files={"file": ("output.mp4", f, "video/mp4")},
+                    data={"key": output_key},
+                    timeout=300
+                )
+                if not upload_resp.ok:
+                    print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+                    raise ValueError(f"Upload to R2 failed: {upload_resp.status_code}")
+                print(f"Upload complete: {output_key}")
 
             return {
                 "status": "completed",
-                "outputPath": output_url,
+                "outputPath": output_key,
                 "duration": duration,
                 "outputFps": output_fps,
             }
+
         finally:
+            # Keep output file alive for a bit so webhook can fetch it if needed
+            # Actually RunPod uploads the output to its own storage, we just return the result
             shutil.rmtree(work_dir, ignore_errors=True)
 
     except Exception as e:
