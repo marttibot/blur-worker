@@ -14,6 +14,7 @@ import shutil
 import requests
 import cv2
 import torch
+import torch.nn.functional as F
 
 # Detect device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,12 +127,21 @@ def interpolate_frames(
         img0 = img0.to(DEVICE)
         img1 = img1.to(DEVICE)
 
+        # Pad to multiples of 32 (required by RIFE)
+        _, _, h, w = img0.shape
+        ph = ((h - 1) // 32 + 1) * 32
+        pw = ((w - 1) // 32 + 1) * 32
+        padding = (0, pw - w, 0, ph - h)
+        img0 = F.pad(img0, padding)
+        img1 = F.pad(img1, padding)
+
         # Generate intermediate frames
         with torch.no_grad():
             for j in range(1, multiplier):
                 t = j / multiplier
                 mid = model.inference(img0, img1, timestep=t)
-                mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)
+                # Crop back to original size
+                mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
 
                 out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
