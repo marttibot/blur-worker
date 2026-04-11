@@ -35,9 +35,11 @@ RUN wget -q "https://huggingface.co/hzwer/RIFE/resolve/main/RIFE_train_log.zip" 
     mv /workspace/RIFE/RIFE_train_log /workspace/RIFE/train_log && \
     rm /tmp/RIFE_train_log.zip
 
-# Verify weights exist AND CUDA works
-RUN cd /workspace/RIFE && python -c "import os; assert os.path.exists('train_log/flownet.pkl'), 'Weights missing'; print('Weights found OK')" && \
-    python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); assert torch.cuda.is_available(), 'CUDA not available!'"
+# Verify weights exist
+RUN cd /workspace/RIFE && python -c "import os; assert os.path.exists('train_log/flownet.pkl'), 'Weights missing'; print('Weights found OK')"
+
+# Verify torch has CUDA build (can't test is_available without GPU)
+RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA built: {torch.version.cuda}')"
 
 COPY worker.py /workspace/worker.py
 
