@@ -106,11 +106,11 @@ def handler(event: dict) -> dict:
             # Interpolated FPS (full multiplier)
             interpolated_fps = source_fps * multiplier
 
-            # Calculate tmix blend frames based on interpolation ratio
-            # ratio = interpolated_fps / output_fps = how many interp frames per output frame
-            # blend_frames = ratio * blur_amount
+            # Blend frames for tmix — keep it small for performance
+            # At target output FPS, blend_frames = ceil(ratio) where ratio = interp/target
+            # But cap at 3-4 to keep ffmpeg fast
             ratio = interpolated_fps / target_output_fps
-            blend_frames = max(2, round(ratio * blur_amount))
+            blend_frames = min(4, max(2, round(blur_amount * 2)))
 
             print(f"Source: {w}x{h} @ {source_fps:.2f}fps")
             print(f"Interpolation: {multiplier}x → {interpolated_fps:.0f}fps")
@@ -118,16 +118,12 @@ def handler(event: dict) -> dict:
             print(f"Codec: {codec}, CRF: {quality}")
 
             # ===== Build ffmpeg filter chain =====
-            # Order: tmix (motion blur) → fps (downsample to target) → eq (color filters)
+            # Since we output at target FPS directly (not interpolated), no need for fps filter
             filters = []
 
             if blur_amount > 0:
                 weights = " ".join(["1"] * blend_frames)
                 filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
-
-            # Downsample to target output FPS
-            if interpolated_fps > target_output_fps:
-                filters.append(f"fps={target_output_fps}")
 
             # Color filters
             eq_parts = []
@@ -151,7 +147,7 @@ def handler(event: dict) -> dict:
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "-s", f"{w}x{h}",
-                "-r", str(interpolated_fps),
+                "-r", str(target_output_fps),
                 "-i", "-",
                 "-vf", filter_str,
                 "-c:v", vcodec, "-crf", str(quality),
@@ -197,32 +193,44 @@ def handler(event: dict) -> dict:
             def pad_image(img):
                 return F.pad(img, padding)
 
-            # ===== Stream: decode → dedup → interpolate → pipe to ffmpeg =====
+            # ===== Stream: decode → dedup → interpolate → select target fps frames → pipe to ffmpeg =====
             cap = cv2.VideoCapture(video_path)
             prev_frame = None
             frame_idx = 0
             frames_written = 0
             dedup_skipped = 0
 
+            # Frame selection: from interpolated frames, pick every Nth to hit target FPS
+            # interp_fps / target_fps = frames to skip between selections
+            frames_per_output = interpolated_fps / target_output_fps
+            interp_counter = 0  # counts total interpolated frames produced
+            next_output_at = 0  # which interp frame index to output next
+
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # Write current frame
-                try:
-                    proc.stdin.write(frame.tobytes())
-                except BrokenPipeError:
-                    print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}")
-                    break
-                frames_written += 1
+                # Check if this source frame maps to an output frame
+                should_output = (interp_counter >= next_output_at)
+
+                if should_output:
+                    try:
+                        proc.stdin.write(frame.tobytes())
+                    except BrokenPipeError:
+                        print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}")
+                        break
+                    frames_written += 1
+                    next_output_at += frames_per_output
+
+                interp_counter += 1
 
                 if prev_frame is not None:
-                    # Dedup check: compute mean absolute difference
+                    # Dedup check
                     diff = np.abs(prev_frame.astype(np.float32) - frame.astype(np.float32)).mean()
 
                     if diff > 1.5:
-                        # Frames are different — interpolate
+                        # Interpolate between prev and current
                         img0 = torch.from_numpy(prev_frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
                         img1 = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
                         img0 = pad_image(img0).to(DEVICE)
@@ -234,25 +242,30 @@ def handler(event: dict) -> dict:
                                 mid = model.inference(img0, img1, timestep=t, scale=1.0)
                                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                                try:
-                                    proc.stdin.write(mid_bgr.tobytes())
-                                except BrokenPipeError:
-                                    print("[ERROR] ffmpeg stdin broken during interpolation")
-                                    break
-                                frames_written += 1
+
+                                interp_counter += 1
+                                if interp_counter >= next_output_at:
+                                    try:
+                                        proc.stdin.write(mid_bgr.tobytes())
+                                    except BrokenPipeError:
+                                        break
+                                    frames_written += 1
+                                    next_output_at += frames_per_output
 
                         del img0, img1
                     else:
-                        # Frames too similar — repeat current frame (dedup)
+                        # Dedup: repeat current frame
                         dedup_skipped += 1
                         for _ in range(1, multiplier):
-                            try:
-                                proc.stdin.write(frame.tobytes())
-                            except BrokenPipeError:
-                                break
-                            frames_written += 1
+                            interp_counter += 1
+                            if interp_counter >= next_output_at:
+                                try:
+                                    proc.stdin.write(frame.tobytes())
+                                except BrokenPipeError:
+                                    break
+                                frames_written += 1
+                                next_output_at += frames_per_output
 
-                    # Free GPU memory periodically
                     if frame_idx % 30 == 0:
                         torch.cuda.empty_cache()
 
