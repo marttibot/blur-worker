@@ -1,22 +1,23 @@
 """
 RunPod Serverless Worker for Blur
 Handles video motion blur via RIFE interpolation + ffmpeg frame blending.
+Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
 """
 
 import os
+import sys
 import json
 import subprocess
 import tempfile
 import shutil
-import sys
 
 import requests
 import cv2
 import torch
 
-# Detect device — CUDA if available, else CPU
+# Detect device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[init] PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, device: {DEVICE}")
+print(f"[init] PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, device: {DEVICE}")
 if torch.cuda.is_available():
     print(f"[init] GPU: {torch.cuda.get_device_name(0)}")
 
@@ -60,7 +61,6 @@ def extract_frames(video_path: str, output_dir: str) -> int:
     if result.returncode != 0:
         raise ValueError(f"Frame extraction failed: {result.stderr}")
 
-    # Get source FPS from video info
     info = get_video_info(video_path)
     video_stream = next(
         (s for s in info["streams"] if s["codec_type"] == "video"),
@@ -84,24 +84,16 @@ def interpolate_frames(
     output_dir: str,
     multiplier: int
 ) -> None:
-    """Interpolate frames using RIFE. Writes output frames directly to output_dir."""
+    """Interpolate frames using RIFE v4.25 HDv3 model."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Import RIFE model
+    # Add RIFE to path and import the model from train_log
     sys.path.insert(0, "/workspace/RIFE")
+    sys.path.insert(0, "/workspace/RIFE/train_log")
 
-    # Monkey-patch torch.load to always load to CPU first (safe deserialization),
-    # then move model to DEVICE after loading
-    _original_torch_load = torch.load
-    def _safe_torch_load(*args, **kwargs):
-        kwargs.setdefault("map_location", "cpu")
-        kwargs.setdefault("weights_only", False)
-        return _original_torch_load(*args, **kwargs)
-    torch.load = _safe_torch_load
+    from RIFE_HDv3 import Model as RIFEModel
 
-    from model.RIFE import Model as RIFEModel
-
-    print("Loading RIFE model...")
+    print("Loading RIFE v4.25 model...")
     model = RIFEModel()
     model.load_model("/workspace/RIFE/train_log", -1)
     model.eval()
@@ -119,15 +111,15 @@ def interpolate_frames(
 
     for i in range(len(frame_files)):
         # Write original frame
-        img1_bgr = cv2.imread(frame_files[i])
+        img_bgr = cv2.imread(frame_files[i])
         out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
-        cv2.imwrite(out_path, img1_bgr)
+        cv2.imwrite(out_path, img_bgr)
         output_idx += 1
 
         if i >= len(frame_files) - 1:
             break
 
-        # Read next frame for interpolation — move to detected device
+        # Read frames for interpolation
         img0 = torch.from_numpy(cv2.imread(frame_files[i])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
         img1 = torch.from_numpy(cv2.imread(frame_files[i + 1])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
 
@@ -138,7 +130,7 @@ def interpolate_frames(
         with torch.no_grad():
             for j in range(1, multiplier):
                 t = j / multiplier
-                mid = model.inference(img0, img1, t)
+                mid = model.inference(img0, img1, timestep=t)
                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)
                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
 
@@ -165,7 +157,6 @@ def blend_and_encode(
     saturation = float(config.get("saturation", 1.0))
     contrast = float(config.get("contrast", 1.0))
 
-    # Build ffmpeg filter chain
     filters = []
 
     if blur_amount > 0:
@@ -215,9 +206,7 @@ def handler(event: dict) -> dict:
         output_callback_url = job_input.get("outputCallbackUrl", "")
         job_id = job_input.get("jobId", "unknown")
 
-        print(f"[handler] Job {job_id} started")
-        print(f"[handler] Config: {config}")
-        print(f"[handler] Device: {DEVICE}, CUDA: {torch.cuda.is_available()}")
+        print(f"[handler] Job {job_id} | device: {DEVICE} | CUDA: {torch.cuda.is_available()}")
 
         if not video_url:
             return {"error": "No video URL provided"}
@@ -233,7 +222,6 @@ def handler(event: dict) -> dict:
             print(f"Downloading video from {video_url}...")
             download_file(video_url, video_path)
 
-            # Get video info
             info = get_video_info(video_path)
             duration = float(info["format"]["duration"])
             print(f"Video duration: {duration}s")
@@ -287,7 +275,6 @@ def handler(event: dict) -> dict:
         return {"status": "failed", "error": str(e)}
 
 
-# RunPod serverless entrypoint
 if __name__ == "__main__":
     import runpod
     runpod.serverless.start({"handler": handler})

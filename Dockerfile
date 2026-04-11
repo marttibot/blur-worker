@@ -17,20 +17,28 @@ RUN pip install --no-cache-dir \
     runpod \
     tqdm \
     scipy \
-    einops
+    einops \
+    gdown
 
 WORKDIR /workspace
-RUN git clone https://github.com/hzwer/RIFE.git /workspace/RIFE
 
-# Download pretrained weights from Huggingface
-RUN wget -q "https://huggingface.co/hzwer/RIFE/resolve/main/RIFE_train_log.zip" -O /tmp/RIFE_train_log.zip && \
-    unzip /tmp/RIFE_train_log.zip -d /workspace/RIFE/ && \
-    mv /workspace/RIFE/RIFE_train_log /workspace/RIFE/train_log && \
-    rm /tmp/RIFE_train_log.zip
+# Clone Practical-RIFE (the current maintained repo with matching model code)
+RUN git clone https://github.com/hzwer/Practical-RIFE.git /workspace/RIFE
 
-# Verify weights and torch CUDA build
-RUN python -c "import os; assert os.path.exists('/workspace/RIFE/train_log/flownet.pkl'), 'Weights missing'; print('Weights OK')" && \
-    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA build: {torch.version.cuda}, cuDNN: {torch.backends.cudnn.version() if torch.cuda.is_available() else \"N/A (no GPU at build)\"}')" 
+# Download v4.25 pretrained weights (includes flownet.pkl + model .py files)
+RUN gdown "1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg" -O /tmp/rife-v425.zip && \
+    unzip -o /tmp/rife-v425.zip -d /tmp/rife-v425/ && \
+    cp -r /tmp/rife-v425/train_log /workspace/RIFE/train_log && \
+    rm -rf /tmp/rife-v425 /tmp/rife-v425.zip
+
+# Verify everything is in place
+RUN python -c "\
+import os; \
+assert os.path.exists('/workspace/RIFE/train_log/flownet.pkl'), 'Weights missing'; \
+assert os.path.exists('/workspace/RIFE/train_log/RIFE_HDv3.py'), 'Model class missing'; \
+assert os.path.exists('/workspace/RIFE/train_log/IFNet_HDv3.py'), 'IFNet missing'; \
+import torch; print(f'PyTorch {torch.__version__}, CUDA build: {torch.version.cuda}'); \
+print('All model files present ✅')"
 
 COPY worker.py /workspace/worker.py
 
