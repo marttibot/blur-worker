@@ -14,6 +14,12 @@ import requests
 import cv2
 import torch
 
+# Detect device — CUDA if available, else CPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[init] PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"[init] GPU: {torch.cuda.get_device_name(0)}")
+
 
 def download_file(url: str, dest: str) -> None:
     """Download a file from URL to destination."""
@@ -84,8 +90,8 @@ def interpolate_frames(
     # Import RIFE model
     sys.path.insert(0, "/workspace/RIFE")
 
-    # Monkey-patch torch.load to always use map_location=cpu for safe loading,
-    # then move to CUDA manually after load_state_dict
+    # Monkey-patch torch.load to always load to CPU first (safe deserialization),
+    # then move model to DEVICE after loading
     _original_torch_load = torch.load
     def _safe_torch_load(*args, **kwargs):
         kwargs.setdefault("map_location", "cpu")
@@ -100,7 +106,7 @@ def interpolate_frames(
     model.load_model("/workspace/RIFE/train_log", -1)
     model.eval()
     model.device()
-    print("RIFE model loaded.")
+    print(f"RIFE model loaded on {DEVICE}.")
 
     # Get input frames
     frame_files = sorted([
@@ -121,12 +127,12 @@ def interpolate_frames(
         if i >= len(frame_files) - 1:
             break
 
-        # Read next frame for interpolation
+        # Read next frame for interpolation — move to detected device
         img0 = torch.from_numpy(cv2.imread(frame_files[i])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
         img1 = torch.from_numpy(cv2.imread(frame_files[i + 1])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
 
-        img0 = img0.cuda()
-        img1 = img1.cuda()
+        img0 = img0.to(DEVICE)
+        img1 = img1.to(DEVICE)
 
         # Generate intermediate frames
         with torch.no_grad():
@@ -209,6 +215,10 @@ def handler(event: dict) -> dict:
         output_callback_url = job_input.get("outputCallbackUrl", "")
         job_id = job_input.get("jobId", "unknown")
 
+        print(f"[handler] Job {job_id} started")
+        print(f"[handler] Config: {config}")
+        print(f"[handler] Device: {DEVICE}, CUDA: {torch.cuda.is_available()}")
+
         if not video_url:
             return {"error": "No video URL provided"}
 
@@ -272,6 +282,8 @@ def handler(event: dict) -> dict:
 
     except Exception as e:
         print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {"status": "failed", "error": str(e)}
 
 

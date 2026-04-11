@@ -1,21 +1,14 @@
-FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     git \
     unzip \
     wget \
-    python3 \
-    python3-pip \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -s /usr/bin/python3 /usr/bin/python
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install PyTorch with CUDA support explicitly
-RUN pip install --no-cache-dir \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-# Install remaining Python deps
+# Install remaining Python deps (torch already in base image)
 RUN pip install --no-cache-dir \
     opencv-python-headless \
     numpy \
@@ -35,15 +28,13 @@ RUN wget -q "https://huggingface.co/hzwer/RIFE/resolve/main/RIFE_train_log.zip" 
     mv /workspace/RIFE/RIFE_train_log /workspace/RIFE/train_log && \
     rm /tmp/RIFE_train_log.zip
 
-# Verify weights exist
-RUN cd /workspace/RIFE && python -c "import os; assert os.path.exists('train_log/flownet.pkl'), 'Weights missing'; print('Weights found OK')"
-
-# Verify torch has CUDA build (can't test is_available without GPU)
-RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA built: {torch.version.cuda}')"
+# Verify weights and torch CUDA build
+RUN python -c "import os; assert os.path.exists('/workspace/RIFE/train_log/flownet.pkl'), 'Weights missing'; print('Weights OK')" && \
+    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA build: {torch.version.cuda}, cuDNN: {torch.backends.cudnn.version() if torch.cuda.is_available() else \"N/A (no GPU at build)\"}')" 
 
 COPY worker.py /workspace/worker.py
 
 WORKDIR /workspace
 ENV PYTHONPATH="/workspace/RIFE:$PYTHONPATH"
 
-CMD ["python3", "worker.py"]
+CMD ["python3", "/workspace/worker.py"]
