@@ -110,7 +110,7 @@ def handler(event: dict) -> dict:
             # At target output FPS, blend_frames = ceil(ratio) where ratio = interp/target
             # But cap at 3-4 to keep ffmpeg fast
             ratio = interpolated_fps / target_output_fps
-            blend_frames = min(4, max(2, round(blur_amount * 2)))
+            blend_frames = max(2, round(ratio * blur_amount))
 
             print(f"Source: {w}x{h} @ {source_fps:.2f}fps")
             print(f"Interpolation: {multiplier}x → {interpolated_fps:.0f}fps")
