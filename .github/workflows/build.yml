@@ -25,6 +25,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/marttibot/blur-worker:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/marttibot/blur-worker:latest
+            ghcr.io/marttibot/blur-worker:${{ github.sha }}
+          no-cache: true
