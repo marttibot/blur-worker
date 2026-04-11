@@ -16,6 +16,8 @@ import requests
 import cv2
 import torch
 import torch.nn.functional as F
+import boto3
+from botocore.config import Config as BotoConfig
 
 # Detect device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,10 +217,22 @@ def handler(event: dict) -> dict:
             print(f"Encoding at {output_fps:.0f} fps...")
             blend_and_encode(interp_dir, output_path, config, output_fps)
 
+            # Upload output directly to R2
+            output_key = f"jobs/{job_id}/output.mp4"
+            print(f"Uploading output to R2: {output_key}...")
+            r2 = boto3.client(
+                "s3",
+                endpoint_url="https://db62c194342e7bde5f3a192d3879680c.r2.cloudflarestorage.com",
+                aws_access_key_id="0d24cbc72ed92460208b48ac016fa264",
+                aws_secret_access_key="a312c485489cbf320ee6ecc3e1c5b5cd17c7f06765637f93e6c49d1831b3d133",
+                config=BotoConfig(region_name="auto"),
+            )
+            r2.upload_file(output_path, "blur-renders", output_key, ExtraArgs={"ContentType": "video/mp4"})
+            print(f"Upload complete: {output_key}")
+
             return {
                 "status": "completed",
-                "outputKey": f"jobs/{job_id}/output.mp4",
-                "outputBase64": "data:video/mp4;base64," + base64.b64encode(open(output_path, "rb").read()).decode("utf-8"),
+                "outputKey": output_key,
                 "duration": duration,
                 "outputFps": output_fps,
             }
