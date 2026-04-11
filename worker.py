@@ -83,6 +83,16 @@ def interpolate_frames(
 
     # Import RIFE model
     sys.path.insert(0, "/workspace/RIFE")
+
+    # Monkey-patch torch.load to always use map_location=cpu for safe loading,
+    # then move to CUDA manually after load_state_dict
+    _original_torch_load = torch.load
+    def _safe_torch_load(*args, **kwargs):
+        kwargs.setdefault("map_location", "cpu")
+        kwargs.setdefault("weights_only", False)
+        return _original_torch_load(*args, **kwargs)
+    torch.load = _safe_torch_load
+
     from model.RIFE import Model as RIFEModel
 
     print("Loading RIFE model...")
@@ -122,7 +132,7 @@ def interpolate_frames(
         with torch.no_grad():
             for j in range(1, multiplier):
                 t = j / multiplier
-                mid = model.inference(img0, img1, timestep=t)
+                mid = model.inference(img0, img1, t)
                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)
                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
 
