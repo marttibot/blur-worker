@@ -3,8 +3,8 @@ RunPod Serverless Worker for Blur
 Handles video motion blur via RIFE interpolation + ffmpeg frame blending.
 Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
 
-Optimized: streams interpolated frames directly into ffmpeg via pipe.
-No intermediate PNG files for output — much faster encoding.
+Memory-efficient: processes frame pairs from video one at a time,
+streams interpolated frames directly into ffmpeg via pipe.
 """
 
 import os
@@ -13,13 +13,11 @@ import json
 import subprocess
 import tempfile
 import shutil
-import struct
-import numpy as np
 
-import requests
 import cv2
 import torch
 import torch.nn.functional as F
+import requests
 import boto3
 from botocore.config import Config as BotoConfig
 
@@ -78,7 +76,7 @@ def handler(event: dict) -> dict:
             video_stream = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
             if not video_stream:
                 raise ValueError("No video stream found")
-            
+
             fps = eval(video_stream["r_frame_rate"])
             width = int(video_stream["width"])
             height = int(video_stream["height"])
@@ -86,43 +84,7 @@ def handler(event: dict) -> dict:
 
             print(f"Video: {width}x{height} @ {fps:.2f}fps → {multiplier}x → {output_fps:.0f}fps")
 
-            # ===== PHASE 1: Decode all frames to numpy arrays in memory =====
-            print("Decoding frames...")
-            cap = cv2.VideoCapture(video_path)
-            frames_bgr = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frames_bgr.append(frame)
-            cap.release()
-            print(f"Decoded {len(frames_bgr)} frames")
-
-            if len(frames_bgr) < 2:
-                raise ValueError("Video has fewer than 2 frames")
-
-            # ===== PHASE 2: Set up RIFE model =====
-            sys.path.insert(0, "/workspace/RIFE")
-            sys.path.insert(0, "/workspace/RIFE/train_log")
-            from RIFE_HDv3 import Model as RIFEModel
-
-            print("Loading RIFE v4.25 model...")
-            model = RIFEModel()
-            model.load_model("/workspace/RIFE/train_log", -1)
-            model.eval()
-            model.device()
-            print(f"RIFE model loaded on {DEVICE}.")
-
-            h, w = frames_bgr[0].shape[:2]
-            tmp = 128
-            ph = ((h - 1) // tmp + 1) * tmp
-            pw = ((w - 1) // tmp + 1) * tmp
-            padding = (0, pw - w, 0, ph - h)
-
-            def pad_image(img):
-                return F.pad(img, padding)
-
-            # ===== PHASE 3: Build ffmpeg encoder pipeline =====
+            # ===== Build ffmpeg encoder pipeline =====
             blur_amount = float(config.get("blurAmount", 1.0))
             quality = int(config.get("quality", 20))
             brightness = float(config.get("brightness", 1.0))
@@ -145,13 +107,12 @@ def handler(event: dict) -> dict:
             filter_str = ",".join(filters) if filters else "null"
 
             output_path = os.path.join(work_dir, "output.mp4")
-            total_expected = len(frames_bgr) + (len(frames_bgr) - 1) * (multiplier - 1)
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
-                "-s", f"{w}x{h}",
+                "-s", f"{width}x{height}",
                 "-r", str(output_fps),
                 "-i", "-",
                 "-vf", filter_str,
@@ -161,9 +122,7 @@ def handler(event: dict) -> dict:
                 output_path
             ]
 
-            print(f"Starting ffmpeg encoder (expecting {total_expected} frames)...")
-            print(f"  cmd: {' '.join(ffmpeg_cmd)}")
-            
+            print(f"Starting ffmpeg encoder...")
             proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
@@ -171,45 +130,80 @@ def handler(event: dict) -> dict:
                 stderr=subprocess.PIPE,
             )
 
-            # ===== PHASE 4: Interpolate + stream frames directly to ffmpeg =====
-            frames_written = 0
-            for i in range(len(frames_bgr)):
-                # Write original frame
-                proc.stdin.write(frames_bgr[i].tobytes())
-                frames_written += 1
+            # ===== Set up RIFE model =====
+            sys.path.insert(0, "/workspace/RIFE")
+            sys.path.insert(0, "/workspace/RIFE/train_log")
+            from RIFE_HDv3 import Model as RIFEModel
 
-                if i >= len(frames_bgr) - 1:
+            print("Loading RIFE v4.25 model...")
+            model = RIFEModel()
+            model.load_model("/workspace/RIFE/train_log", -1)
+            model.eval()
+            model.device()
+            print(f"RIFE model loaded on {DEVICE}.")
+
+            h, w = height, width
+            tmp = 128
+            ph = ((h - 1) // tmp + 1) * tmp
+            pw = ((w - 1) // tmp + 1) * tmp
+            padding = (0, pw - w, 0, ph - h)
+
+            def pad_image(img):
+                return F.pad(img, padding)
+
+            # ===== Stream: read frame pairs → interpolate → pipe to ffmpeg =====
+            cap = cv2.VideoCapture(video_path)
+            frames_written = 0
+            prev_frame = None
+            frame_idx = 0
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
                     break
 
-                # Interpolate between frame i and frame i+1
-                img0 = torch.from_numpy(frames_bgr[i]).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                img1 = torch.from_numpy(frames_bgr[i + 1]).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                img0 = pad_image(img0).to(DEVICE)
-                img1 = pad_image(img1).to(DEVICE)
+                # Write current frame to ffmpeg
+                proc.stdin.write(frame.tobytes())
+                frames_written += 1
 
-                with torch.no_grad():
-                    for j in range(1, multiplier):
-                        t = j / multiplier
-                        mid = model.inference(img0, img1, timestep=t, scale=1.0)
-                        mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-                        # mid_np is RGB, convert to BGR for ffmpeg raw bgr24
-                        mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                        proc.stdin.write(mid_bgr.tobytes())
-                        frames_written += 1
+                if prev_frame is not None:
+                    # Interpolate between prev and current
+                    img0 = torch.from_numpy(prev_frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                    img1 = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                    img0 = pad_image(img0).to(DEVICE)
+                    img1 = pad_image(img1).to(DEVICE)
 
-                if (i + 1) % 10 == 0:
-                    pct = (i + 1) / len(frames_bgr) * 100
-                    print(f"Interpolation: {i + 1}/{len(frames_bgr)} pairs ({pct:.0f}%), {frames_written} frames written")
+                    with torch.no_grad():
+                        for j in range(1, multiplier):
+                            t = j / multiplier
+                            mid = model.inference(img0, img1, timestep=t, scale=1.0)
+                            mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
+                            mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
+                            proc.stdin.write(mid_bgr.tobytes())
+                            frames_written += 1
 
+                    # Free GPU memory
+                    del img0, img1
+                    if frame_idx % 20 == 0:
+                        torch.cuda.empty_cache()
+
+                prev_frame = frame
+                frame_idx += 1
+
+                if frame_idx % 30 == 0:
+                    pct = frame_idx / (duration * fps) * 100
+                    print(f"Progress: {frame_idx}/{int(duration * fps)} frames ({pct:.0f}%), {frames_written} output frames")
+
+            cap.release()
             proc.stdin.close()
             stdout, stderr = proc.communicate(timeout=300)
 
             if proc.returncode != 0:
                 raise ValueError(f"ffmpeg encoding failed (code {proc.returncode}): {stderr.decode()[-500:]}")
 
-            print(f"Encoding complete: {frames_written} frames → {output_path}")
+            print(f"Done: {frames_written} frames → {output_path}")
 
-            # ===== PHASE 5: Upload to R2 =====
+            # ===== Upload to R2 =====
             file_size = os.path.getsize(output_path)
             print(f"Output size: {file_size / 1024 / 1024:.1f} MB")
 
