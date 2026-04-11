@@ -2,6 +2,9 @@
 RunPod Serverless Worker for Blur
 Handles video motion blur via RIFE interpolation + ffmpeg frame blending.
 Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
+
+Optimized: streams interpolated frames directly into ffmpeg via pipe.
+No intermediate PNG files for output — much faster encoding.
 """
 
 import os
@@ -10,7 +13,8 @@ import json
 import subprocess
 import tempfile
 import shutil
-import base64
+import struct
+import numpy as np
 
 import requests
 import cv2
@@ -43,141 +47,11 @@ def get_video_info(video_path: str) -> dict:
     return json.loads(result.stdout)
 
 
-def extract_frames(video_path: str, output_dir: str) -> int:
-    os.makedirs(output_dir, exist_ok=True)
-    output_pattern = os.path.join(output_dir, "frame_%06d.png")
-    cmd = ["ffmpeg", "-i", video_path, "-qscale:v", "1", "-vsync", "0", output_pattern]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise ValueError(f"Frame extraction failed: {result.stderr}")
-
-    info = get_video_info(video_path)
-    video_stream = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
-    if not video_stream:
-        raise ValueError("No video stream found")
-    fps = eval(video_stream["r_frame_rate"])
-    frames = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(".png")]
-    print(f"Extracted {len(frames)} frames at {fps:.2f} fps")
-    return fps
-
-
-def interpolate_frames(input_dir: str, output_dir: str, multiplier: int) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-
-    sys.path.insert(0, "/workspace/RIFE")
-    sys.path.insert(0, "/workspace/RIFE/train_log")
-
-    from RIFE_HDv3 import Model as RIFEModel
-
-    print("Loading RIFE v4.25 model...")
-    model = RIFEModel()
-    model.load_model("/workspace/RIFE/train_log", -1)
-    model.eval()
-    model.device()
-    print(f"RIFE model loaded on {DEVICE}.")
-
-    frame_files = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(".png")])
-    if not frame_files:
-        raise ValueError("No frames found")
-
-    first = cv2.imread(frame_files[0])
-    h, w = first.shape[:2]
-    print(f"Frame dimensions: {w}x{h}")
-
-    tmp = 128
-    ph = ((h - 1) // tmp + 1) * tmp
-    pw = ((w - 1) // tmp + 1) * tmp
-    padding = (0, pw - w, 0, ph - h)
-    print(f"Padding: {padding} → {pw}x{ph}")
-
-    def pad_image(img):
-        return F.pad(img, padding)
-
-    output_idx = 0
-
-    for i in range(len(frame_files)):
-        img_bgr = cv2.imread(frame_files[i])
-        out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
-        cv2.imwrite(out_path, img_bgr)
-        output_idx += 1
-
-        if i >= len(frame_files) - 1:
-            break
-
-        img0 = torch.from_numpy(cv2.imread(frame_files[i])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-        img1 = torch.from_numpy(cv2.imread(frame_files[i + 1])).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-        img0 = pad_image(img0).to(DEVICE)
-        img1 = pad_image(img1).to(DEVICE)
-
-        with torch.no_grad():
-            for j in range(1, multiplier):
-                t = j / multiplier
-                mid = model.inference(img0, img1, timestep=t, scale=1.0)
-                mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-                mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                out_path = os.path.join(output_dir, f"interp_{output_idx:06d}.png")
-                cv2.imwrite(out_path, mid_bgr)
-                output_idx += 1
-
-        if i % 10 == 0:
-            print(f"Interpolation progress: {i + 1}/{len(frame_files)}")
-
-    print(f"Generated {output_idx} interpolated frames")
-
-
-def blend_and_encode(frames_dir: str, output_path: str, config: dict, output_fps: float) -> None:
-    blur_amount = float(config.get("blurAmount", 1.0))
-    quality = int(config.get("quality", 20))
-    brightness = float(config.get("brightness", 1.0))
-    saturation = float(config.get("saturation", 1.0))
-    contrast = float(config.get("contrast", 1.0))
-
-    filters = []
-    if blur_amount > 0:
-        blend_frames = max(2, int(blur_amount * 5) + 1)
-        weights = " ".join(["1"] * blend_frames)
-        filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
-
-    if brightness != 1.0 or saturation != 1.0 or contrast != 1.0:
-        eq_parts = []
-        if brightness != 1.0: eq_parts.append(f"brightness={brightness - 1}")
-        if saturation != 1.0: eq_parts.append(f"saturation={saturation}")
-        if contrast != 1.0: eq_parts.append(f"contrast={contrast}")
-        filters.append(f"eq={' : '.join(eq_parts)}")
-
-    filter_str = ",".join(filters) if filters else "null"
-
-    # Use libx264 with veryfast preset for speed (libx265 was way too slow)
-    cmd = [
-        "ffmpeg", "-y", "-framerate", str(output_fps),
-        "-i", os.path.join(frames_dir, "interp_%06d.png"),
-        "-vf", filter_str,
-        "-c:v", "libx264", "-crf", str(quality),
-        "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-movflags", "+faststart", output_path
-    ]
-
-    print(f"Encoding with: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise ValueError(f"Encoding failed: {result.stderr}")
-    print("Encoding complete.")
-
-
-def upload_to_r2(file_path: str, r2_key: str, base_url: str) -> str:
-    """Upload output video to R2 via the app's download/upload API."""
-    # The app has a download proxy but no upload API for workers.
-    # Instead, we'll return the file as base64 in the output and let the webhook handle it.
-    # For now, we just report completion and the outputPath will be constructed by the webhook.
-    return r2_key
-
-
 def handler(event: dict) -> dict:
     job_input = event.get("input", {})
     try:
         config = job_input.get("config", {})
         video_url = job_input.get("videoUrl", "")
-        output_callback_url = job_input.get("outputCallbackUrl", "")
         job_id = job_input.get("jobId", "unknown")
 
         print(f"[handler] Job {job_id} | device: {DEVICE} | CUDA: {torch.cuda.is_available()}")
@@ -201,25 +75,146 @@ def handler(event: dict) -> dict:
             if duration > 65:
                 raise ValueError("Video exceeds 60 second limit")
 
-            # Extract frames
-            print("Extracting frames...")
-            frames_dir = os.path.join(work_dir, "frames")
-            source_fps = extract_frames(video_path, frames_dir)
+            video_stream = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+            if not video_stream:
+                raise ValueError("No video stream found")
+            
+            fps = eval(video_stream["r_frame_rate"])
+            width = int(video_stream["width"])
+            height = int(video_stream["height"])
+            output_fps = fps * multiplier
 
-            # Interpolate
-            print(f"Interpolating {multiplier}x...")
-            interp_dir = os.path.join(work_dir, "interpolated")
-            interpolate_frames(frames_dir, interp_dir, multiplier)
+            print(f"Video: {width}x{height} @ {fps:.2f}fps → {multiplier}x → {output_fps:.0f}fps")
 
-            # Encode
-            output_fps = source_fps * multiplier
+            # ===== PHASE 1: Decode all frames to numpy arrays in memory =====
+            print("Decoding frames...")
+            cap = cv2.VideoCapture(video_path)
+            frames_bgr = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames_bgr.append(frame)
+            cap.release()
+            print(f"Decoded {len(frames_bgr)} frames")
+
+            if len(frames_bgr) < 2:
+                raise ValueError("Video has fewer than 2 frames")
+
+            # ===== PHASE 2: Set up RIFE model =====
+            sys.path.insert(0, "/workspace/RIFE")
+            sys.path.insert(0, "/workspace/RIFE/train_log")
+            from RIFE_HDv3 import Model as RIFEModel
+
+            print("Loading RIFE v4.25 model...")
+            model = RIFEModel()
+            model.load_model("/workspace/RIFE/train_log", -1)
+            model.eval()
+            model.device()
+            print(f"RIFE model loaded on {DEVICE}.")
+
+            h, w = frames_bgr[0].shape[:2]
+            tmp = 128
+            ph = ((h - 1) // tmp + 1) * tmp
+            pw = ((w - 1) // tmp + 1) * tmp
+            padding = (0, pw - w, 0, ph - h)
+
+            def pad_image(img):
+                return F.pad(img, padding)
+
+            # ===== PHASE 3: Build ffmpeg encoder pipeline =====
+            blur_amount = float(config.get("blurAmount", 1.0))
+            quality = int(config.get("quality", 20))
+            brightness = float(config.get("brightness", 1.0))
+            saturation = float(config.get("saturation", 1.0))
+            contrast = float(config.get("contrast", 1.0))
+
+            filters = []
+            if blur_amount > 0:
+                blend_frames = max(2, int(blur_amount * 5) + 1)
+                weights = " ".join(["1"] * blend_frames)
+                filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
+
+            if brightness != 1.0 or saturation != 1.0 or contrast != 1.0:
+                eq_parts = []
+                if brightness != 1.0: eq_parts.append(f"brightness={brightness - 1}")
+                if saturation != 1.0: eq_parts.append(f"saturation={saturation}")
+                if contrast != 1.0: eq_parts.append(f"contrast={contrast}")
+                filters.append(f"eq={' : '.join(eq_parts)}")
+
+            filter_str = ",".join(filters) if filters else "null"
+
             output_path = os.path.join(work_dir, "output.mp4")
-            print(f"Encoding at {output_fps:.0f} fps...")
-            blend_and_encode(interp_dir, output_path, config, output_fps)
+            total_expected = len(frames_bgr) + (len(frames_bgr) - 1) * (multiplier - 1)
 
-            # Upload output directly to R2
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{w}x{h}",
+                "-r", str(output_fps),
+                "-i", "-",
+                "-vf", filter_str,
+                "-c:v", "libx264", "-crf", str(quality),
+                "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                "-movflags", "+faststart",
+                output_path
+            ]
+
+            print(f"Starting ffmpeg encoder (expecting {total_expected} frames)...")
+            print(f"  cmd: {' '.join(ffmpeg_cmd)}")
+            
+            proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # ===== PHASE 4: Interpolate + stream frames directly to ffmpeg =====
+            frames_written = 0
+            for i in range(len(frames_bgr)):
+                # Write original frame
+                proc.stdin.write(frames_bgr[i].tobytes())
+                frames_written += 1
+
+                if i >= len(frames_bgr) - 1:
+                    break
+
+                # Interpolate between frame i and frame i+1
+                img0 = torch.from_numpy(frames_bgr[i]).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                img1 = torch.from_numpy(frames_bgr[i + 1]).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                img0 = pad_image(img0).to(DEVICE)
+                img1 = pad_image(img1).to(DEVICE)
+
+                with torch.no_grad():
+                    for j in range(1, multiplier):
+                        t = j / multiplier
+                        mid = model.inference(img0, img1, timestep=t, scale=1.0)
+                        mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
+                        # mid_np is RGB, convert to BGR for ffmpeg raw bgr24
+                        mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
+                        proc.stdin.write(mid_bgr.tobytes())
+                        frames_written += 1
+
+                if (i + 1) % 10 == 0:
+                    pct = (i + 1) / len(frames_bgr) * 100
+                    print(f"Interpolation: {i + 1}/{len(frames_bgr)} pairs ({pct:.0f}%), {frames_written} frames written")
+
+            proc.stdin.close()
+            stdout, stderr = proc.communicate(timeout=300)
+
+            if proc.returncode != 0:
+                raise ValueError(f"ffmpeg encoding failed (code {proc.returncode}): {stderr.decode()[-500:]}")
+
+            print(f"Encoding complete: {frames_written} frames → {output_path}")
+
+            # ===== PHASE 5: Upload to R2 =====
+            file_size = os.path.getsize(output_path)
+            print(f"Output size: {file_size / 1024 / 1024:.1f} MB")
+
             output_key = f"jobs/{job_id}/output.mp4"
-            print(f"Uploading output to R2: {output_key}...")
+            print(f"Uploading to R2: {output_key}...")
             r2 = boto3.client(
                 "s3",
                 endpoint_url="https://db62c194342e7bde5f3a192d3879680c.r2.cloudflarestorage.com",
@@ -238,8 +233,6 @@ def handler(event: dict) -> dict:
             }
 
         finally:
-            # Keep output file alive for a bit so webhook can fetch it if needed
-            # Actually RunPod uploads the output to its own storage, we just return the result
             shutil.rmtree(work_dir, ignore_errors=True)
 
     except Exception as e:
