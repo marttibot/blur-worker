@@ -91,22 +91,63 @@ def handler(event: dict) -> dict:
             saturation = float(config.get("saturation", 1.0))
             contrast = float(config.get("contrast", 1.0))
 
-            filters = []
+            # Build two-pass pipeline:
+            # Pass 1: Apply motion blur (tmix) on original frames → temp video
+            # Pass 2: Interpolate blurred frames → output
+            # This is MUCH faster than applying tmix after interpolation
+            # (tmix on 1290 frames vs 6450 frames)
+
             if blur_amount > 0:
                 blend_frames = max(2, int(blur_amount * 5) + 1)
                 weights = " ".join(["1"] * blend_frames)
-                filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
+                tmix_filter = f"tmix=frames={blend_frames}:weights='{weights}'"
+            else:
+                tmix_filter = None
 
-            if brightness != 1.0 or saturation != 1.0 or contrast != 1.0:
-                eq_parts = []
-                if brightness != 1.0: eq_parts.append(f"brightness={brightness - 1}")
-                if saturation != 1.0: eq_parts.append(f"saturation={saturation}")
-                if contrast != 1.0: eq_parts.append(f"contrast={contrast}")
-                filters.append(f"eq={' : '.join(eq_parts)}")
+            eq_parts = []
+            if brightness != 1.0: eq_parts.append(f"brightness={brightness - 1}")
+            if saturation != 1.0: eq_parts.append(f"saturation={saturation}")
+            if contrast != 1.0: eq_parts.append(f"contrast={contrast}")
+            eq_filter = f"eq={' : '.join(eq_parts)}" if eq_parts else None
 
-            filter_str = ",".join(filters) if filters else "null"
+            # Build combined pre-interpolation filter
+            pre_filters = []
+            if tmix_filter:
+                pre_filters.append(tmix_filter)
+            if eq_filter:
+                pre_filters.append(eq_filter)
+            pre_filter_str = ",".join(pre_filters) if pre_filters else "null"
 
-            output_path = os.path.join(work_dir, "output.mp4")
+            # If blur is enabled, first create a pre-blurred video to interpolate from
+            if blur_amount > 0:
+                blurred_path = os.path.join(work_dir, "blurred.mp4")
+                print(f"Applying motion blur (tmix) on original frames...")
+                blur_cmd = [
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vf", pre_filter_str,
+                    "-c:v", "libx264", "-crf", str(quality),
+                    "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                    blurred_path
+                ]
+                result = subprocess.run(blur_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise ValueError(f"Pre-blur failed: {result.stderr}")
+                print(f"Pre-blur complete")
+                interp_source = blurred_path
+            else:
+                interp_source = video_path
+
+            if blur_amount > 0:
+                blur_info = get_video_info(blurred_path)
+                blur_stream = next((s for s in blur_info["streams"] if s["codec_type"] == "video"), None)
+                source_fps = eval(blur_stream["r_frame_rate"])
+                width = int(blur_stream["width"])
+                height = int(blur_stream["height"])
+                output_fps = source_fps * multiplier
+                print(f"Blurred video: {width}x{height} @ {source_fps:.2f}fps")
+            else:
+                source_fps = fps
+                output_fps = fps * multiplier
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
@@ -115,7 +156,7 @@ def handler(event: dict) -> dict:
                 "-s", f"{width}x{height}",
                 "-r", str(output_fps),
                 "-i", "-",
-                "-vf", filter_str,
+                "-vf", post_filter_str,
                 "-c:v", "libx264", "-crf", str(quality),
                 "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 "-movflags", "+faststart",
@@ -152,7 +193,7 @@ def handler(event: dict) -> dict:
                 return F.pad(img, padding)
 
             # ===== Stream: read frame pairs → interpolate → pipe to ffmpeg =====
-            cap = cv2.VideoCapture(video_path)
+            cap = cv2.VideoCapture(interp_source)
             frames_written = 0
             prev_frame = None
             frame_idx = 0
