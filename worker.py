@@ -3,18 +3,26 @@ RunPod Serverless Worker for Blur
 Handles video motion blur via RIFE interpolation + ffmpeg frame blending.
 Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
 
-Memory-efficient: processes frame pairs from video one at a time,
-streams interpolated frames directly into ffmpeg via pipe.
+Pipeline:
+  1. Pre-blur: Apply tmix motion blur + color filters on original video
+  2. Deduplicate: Skip interpolation on near-identical frame pairs
+  3. Interpolate: RIFE frame interpolation, capped at target FPS
+  4. Encode: Stream directly to ffmpeg (h265 or h264)
+  5. Upload: Direct to R2 via S3 API
+
+Memory-efficient: only 2 frames in memory at any time, raw pipe to ffmpeg.
 """
 
 import os
 import sys
 import json
+import math
 import subprocess
 import tempfile
 import shutil
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 import requests
@@ -57,8 +65,17 @@ def handler(event: dict) -> dict:
         if not video_url:
             return {"error": "No video URL provided"}
 
+        # Parse config
         multiplier_str = str(config.get("interpolationMultiplier", "5x"))
-        multiplier = int(multiplier_str.replace("x", ""))
+        max_multiplier = int(multiplier_str.replace("x", ""))
+        blur_amount = float(config.get("blurAmount", 1.0))
+        quality = int(config.get("quality", 20))
+        brightness = float(config.get("brightness", 1.0))
+        saturation = float(config.get("saturation", 1.0))
+        contrast = float(config.get("contrast", 1.0))
+        codec = str(config.get("codec", "h265")).lower()
+        target_output_fps = int(config.get("outputFps", 60))
+
         work_dir = tempfile.mkdtemp()
 
         try:
@@ -77,93 +94,70 @@ def handler(event: dict) -> dict:
             if not video_stream:
                 raise ValueError("No video stream found")
 
-            fps = eval(video_stream["r_frame_rate"])
+            source_fps = eval(video_stream["r_frame_rate"])
             width = int(video_stream["width"])
             height = int(video_stream["height"])
-            output_fps = fps * multiplier
+            h, w = height, width
 
-            print(f"Video: {width}x{height} @ {fps:.2f}fps → {multiplier}x → {output_fps:.0f}fps")
+            # Calculate interpolation multiplier, capped at target output FPS
+            actual_multiplier = min(max_multiplier, max(1, math.ceil(target_output_fps / source_fps)))
+            output_fps = source_fps * actual_multiplier
+            print(f"Source: {w}x{h} @ {source_fps:.2f}fps | Multiplier: {actual_multiplier}x → {output_fps:.0f}fps | Codec: {codec}")
 
-            # ===== Build ffmpeg encoder pipeline =====
-            blur_amount = float(config.get("blurAmount", 1.0))
-            quality = int(config.get("quality", 20))
-            brightness = float(config.get("brightness", 1.0))
-            saturation = float(config.get("saturation", 1.0))
-            contrast = float(config.get("contrast", 1.0))
-
-            # Build two-pass pipeline:
-            # Pass 1: Apply motion blur (tmix) on original frames → temp video
-            # Pass 2: Interpolate blurred frames → output
-            # This is MUCH faster than applying tmix after interpolation
-            # (tmix on 1290 frames vs 6450 frames)
-
+            # ===== PHASE 1: Pre-blur + color filters on original video =====
+            pre_filters = []
             if blur_amount > 0:
                 blend_frames = max(2, int(blur_amount * 5) + 1)
                 weights = " ".join(["1"] * blend_frames)
-                tmix_filter = f"tmix=frames={blend_frames}:weights='{weights}'"
-            else:
-                tmix_filter = None
+                pre_filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
 
             eq_parts = []
-            if brightness != 1.0: eq_parts.append(f"brightness={brightness - 1}")
-            if saturation != 1.0: eq_parts.append(f"saturation={saturation}")
-            if contrast != 1.0: eq_parts.append(f"contrast={contrast}")
-            eq_filter = f"eq={' : '.join(eq_parts)}" if eq_parts else None
+            if brightness != 1.0:
+                eq_parts.append(f"brightness={brightness - 1}")
+            if saturation != 1.0:
+                eq_parts.append(f"saturation={saturation}")
+            if contrast != 1.0:
+                eq_parts.append(f"contrast={contrast}")
+            if eq_parts:
+                pre_filters.append(f"eq={' : '.join(eq_parts)}")
 
-            # Build combined pre-interpolation filter
-            pre_filters = []
-            if tmix_filter:
-                pre_filters.append(tmix_filter)
-            if eq_filter:
-                pre_filters.append(eq_filter)
-            pre_filter_str = ",".join(pre_filters) if pre_filters else "null"
-
-            # If blur is enabled, first create a pre-blurred video to interpolate from
-            if blur_amount > 0:
+            if pre_filters:
+                pre_filter_str = ",".join(pre_filters)
                 blurred_path = os.path.join(work_dir, "blurred.mp4")
-                print(f"Applying motion blur (tmix) on original frames...")
+                print(f"Pre-processing (blur + filters): {pre_filter_str}")
                 blur_cmd = [
                     "ffmpeg", "-y", "-i", video_path,
                     "-vf", pre_filter_str,
-                    "-c:v", "libx264", "-crf", str(quality),
-                    "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                    "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
+                    "-pix_fmt", "yuv420p",
                     blurred_path
                 ]
                 result = subprocess.run(blur_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
-                    raise ValueError(f"Pre-blur failed: {result.stderr}")
-                print(f"Pre-blur complete")
+                    raise ValueError(f"Pre-blur failed: {result.stderr[-500:]}")
+                print(f"Pre-blur complete ({os.path.getsize(blurred_path)/1024/1024:.1f} MB)")
                 interp_source = blurred_path
             else:
                 interp_source = video_path
 
-            if blur_amount > 0:
-                blur_info = get_video_info(blurred_path)
-                blur_stream = next((s for s in blur_info["streams"] if s["codec_type"] == "video"), None)
-                source_fps = eval(blur_stream["r_frame_rate"])
-                width = int(blur_stream["width"])
-                height = int(blur_stream["height"])
-                output_fps = source_fps * multiplier
-                print(f"Blurred video: {width}x{height} @ {source_fps:.2f}fps")
-            else:
-                source_fps = fps
-                output_fps = fps * multiplier
+            # ===== PHASE 2: Start ffmpeg encoder (receives raw frames via pipe) =====
+            output_path = os.path.join(work_dir, "output.mp4")
+            vcodec = "libx265" if codec == "h265" else "libx264"
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
-                "-s", f"{width}x{height}",
+                "-s", f"{w}x{h}",
                 "-r", str(output_fps),
                 "-i", "-",
-                "-vf", post_filter_str,
-                "-c:v", "libx264", "-crf", str(quality),
+                "-c:v", vcodec, "-crf", str(quality),
                 "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 "-movflags", "+faststart",
                 output_path
             ]
 
-            print(f"Starting ffmpeg encoder...")
+            print(f"Starting ffmpeg encoder ({vcodec} crf{quality})...")
             proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
@@ -171,7 +165,7 @@ def handler(event: dict) -> dict:
                 stderr=subprocess.PIPE,
             )
 
-            # ===== Set up RIFE model =====
+            # ===== PHASE 3: Load RIFE model =====
             sys.path.insert(0, "/workspace/RIFE")
             sys.path.insert(0, "/workspace/RIFE/train_log")
             from RIFE_HDv3 import Model as RIFEModel
@@ -183,7 +177,7 @@ def handler(event: dict) -> dict:
             model.device()
             print(f"RIFE model loaded on {DEVICE}.")
 
-            h, w = height, width
+            # Padding for RIFE (must be multiple of 128)
             tmp = 128
             ph = ((h - 1) // tmp + 1) * tmp
             pw = ((w - 1) // tmp + 1) * tmp
@@ -192,48 +186,62 @@ def handler(event: dict) -> dict:
             def pad_image(img):
                 return F.pad(img, padding)
 
-            # ===== Stream: read frame pairs → interpolate → pipe to ffmpeg =====
+            # ===== PHASE 4: Stream frames → dedup → interpolate → pipe to ffmpeg =====
             cap = cv2.VideoCapture(interp_source)
-            frames_written = 0
             prev_frame = None
             frame_idx = 0
+            frames_written = 0
+            dedup_skipped = 0
 
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # Write current frame to ffmpeg
+                # Always write the current frame
                 proc.stdin.write(frame.tobytes())
                 frames_written += 1
 
                 if prev_frame is not None:
-                    # Interpolate between prev and current
-                    img0 = torch.from_numpy(prev_frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                    img1 = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                    img0 = pad_image(img0).to(DEVICE)
-                    img1 = pad_image(img1).to(DEVICE)
+                    # Dedup check: compute mean absolute difference
+                    diff = np.abs(prev_frame.astype(np.float32) - frame.astype(np.float32)).mean()
 
-                    with torch.no_grad():
-                        for j in range(1, multiplier):
-                            t = j / multiplier
-                            mid = model.inference(img0, img1, timestep=t, scale=1.0)
-                            mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-                            mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                            proc.stdin.write(mid_bgr.tobytes())
+                    if diff > 1.5:
+                        # Frames are different — interpolate
+                        img0 = torch.from_numpy(prev_frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                        img1 = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                        img0 = pad_image(img0).to(DEVICE)
+                        img1 = pad_image(img1).to(DEVICE)
+
+                        with torch.no_grad():
+                            for j in range(1, actual_multiplier):
+                                t = j / actual_multiplier
+                                mid = model.inference(img0, img1, timestep=t, scale=1.0)
+                                mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
+                                mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
+                                proc.stdin.write(mid_bgr.tobytes())
+                                frames_written += 1
+
+                        del img0, img1
+                    else:
+                        # Frames too similar — repeat current frame (dedup)
+                        dedup_skipped += 1
+                        for _ in range(1, actual_multiplier):
+                            proc.stdin.write(frame.tobytes())
                             frames_written += 1
 
-                    # Free GPU memory
-                    del img0, img1
-                    if frame_idx % 20 == 0:
+                    # Free GPU memory periodically
+                    if frame_idx % 30 == 0:
                         torch.cuda.empty_cache()
 
                 prev_frame = frame
                 frame_idx += 1
 
                 if frame_idx % 30 == 0:
-                    pct = frame_idx / (duration * fps) * 100
-                    print(f"Progress: {frame_idx}/{int(duration * fps)} frames ({pct:.0f}%), {frames_written} output frames")
+                    est_total = int(duration * source_fps)
+                    pct = frame_idx / est_total * 100
+                    print(f"Progress: {frame_idx}/{est_total} src frames ({pct:.0f}%), "
+                          f"{frames_written} out frames, {dedup_skipped} deduped")
 
             cap.release()
             proc.stdin.close()
@@ -242,11 +250,11 @@ def handler(event: dict) -> dict:
             if proc.returncode != 0:
                 raise ValueError(f"ffmpeg encoding failed (code {proc.returncode}): {stderr.decode()[-500:]}")
 
-            print(f"Done: {frames_written} frames → {output_path}")
+            print(f"Encoding complete: {frames_written} frames, {dedup_skipped} pairs deduped")
 
-            # ===== Upload to R2 =====
+            # ===== PHASE 5: Upload to R2 =====
             file_size = os.path.getsize(output_path)
-            print(f"Output size: {file_size / 1024 / 1024:.1f} MB")
+            print(f"Output: {file_size / 1024 / 1024:.1f} MB")
 
             output_key = f"jobs/{job_id}/output.mp4"
             print(f"Uploading to R2: {output_key}...")
@@ -265,6 +273,7 @@ def handler(event: dict) -> dict:
                 "outputKey": output_key,
                 "duration": duration,
                 "outputFps": output_fps,
+                "dedupSkipped": dedup_skipped,
             }
 
         finally:
