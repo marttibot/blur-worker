@@ -165,6 +165,15 @@ def handler(event: dict) -> dict:
                 stderr=subprocess.PIPE,
             )
 
+            # Thread to capture ffmpeg stderr for debugging
+            import threading
+            stderr_lines = []
+            def read_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line.decode(errors='replace').strip())
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
             # ===== PHASE 3: Load RIFE model =====
             sys.path.insert(0, "/workspace/RIFE")
             sys.path.insert(0, "/workspace/RIFE/train_log")
@@ -199,7 +208,11 @@ def handler(event: dict) -> dict:
                     break
 
                 # Always write the current frame
-                proc.stdin.write(frame.tobytes())
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}. ffmpeg may have crashed.")
+                    break
                 frames_written += 1
 
                 if prev_frame is not None:
@@ -219,7 +232,11 @@ def handler(event: dict) -> dict:
                                 mid = model.inference(img0, img1, timestep=t, scale=1.0)
                                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                                proc.stdin.write(mid_bgr.tobytes())
+                                try:
+                                    proc.stdin.write(mid_bgr.tobytes())
+                                except BrokenPipeError:
+                                    print(f"[ERROR] ffmpeg stdin broken during interpolation.")
+                                    break
                                 frames_written += 1
 
                         del img0, img1
@@ -227,7 +244,11 @@ def handler(event: dict) -> dict:
                         # Frames too similar — repeat current frame (dedup)
                         dedup_skipped += 1
                         for _ in range(1, actual_multiplier):
-                            proc.stdin.write(frame.tobytes())
+                            try:
+                                proc.stdin.write(frame.tobytes())
+                            except BrokenPipeError:
+                                print(f"[ERROR] ffmpeg stdin broken during dedup.")
+                                break
                             frames_written += 1
 
                     # Free GPU memory periodically
@@ -244,11 +265,16 @@ def handler(event: dict) -> dict:
                           f"{frames_written} out frames, {dedup_skipped} deduped")
 
             cap.release()
-            proc.stdin.close()
-            stdout, stderr = proc.communicate(timeout=300)
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            proc.wait(timeout=300)
+            stderr_thread.join(timeout=5)
 
             if proc.returncode != 0:
-                raise ValueError(f"ffmpeg encoding failed (code {proc.returncode}): {stderr.decode()[-500:]}")
+                err_output = "\n".join(stderr_lines[-20:])
+                raise ValueError(f"ffmpeg failed (code {proc.returncode}): {err_output}")
 
             print(f"Encoding complete: {frames_written} frames, {dedup_skipped} pairs deduped")
 
