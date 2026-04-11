@@ -8,7 +8,8 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
 
 # Install PyTorch with CUDA support explicitly
 RUN pip install --no-cache-dir \
@@ -43,4 +44,4 @@ COPY worker.py /workspace/worker.py
 WORKDIR /workspace
 ENV PYTHONPATH="/workspace/RIFE:$PYTHONPATH"
 
-CMD ["python", "worker.py"]
+CMD ["python3", "worker.py"]
