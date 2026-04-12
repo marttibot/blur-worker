@@ -100,8 +100,8 @@ def handler(event: dict) -> dict:
             height = int(video_stream["height"])
             h, w = height, width
 
-            # Cap interpolation so output doesn't exceed 60fps
-            actual_multiplier = min(multiplier, math.ceil(target_output_fps / source_fps))
+            # Use full interpolation multiplier (output FPS handled by ffmpeg fps filter)
+            actual_multiplier = multiplier
             interpolated_fps = source_fps * actual_multiplier
 
             # tmix blend frames: ratio of interpolated to output FPS * blur_amount
