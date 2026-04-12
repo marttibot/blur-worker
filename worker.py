@@ -158,7 +158,9 @@ def handler(event: dict) -> dict:
                 "-c:v", vcodec, "-crf", str(quality),
                 "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 # Audio: copy from source (if present)
-                "-c:a", "aac", "-b:a", "192k", "-map", "1:a?",
+                "-map", "0:v",
+                "-map", "1:a?",
+                "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart",
                 output_path
             ]
