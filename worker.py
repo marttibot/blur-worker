@@ -181,12 +181,32 @@ def handler(event: dict) -> dict:
 
             # ===== Load RIFE model =====
             sys.path.insert(0, "/workspace/RIFE")
-            sys.path.insert(0, "/workspace/RIFE/train_log")
+
+            # Download model weights from R2 if not present
+            import os
+            weights_dir = "/workspace/RIFE/train_log"
+            if not os.path.exists(os.path.join(weights_dir, "flownet.pkl")):
+                print("Downloading RIFE model weights from R2...")
+                os.makedirs(weights_dir, exist_ok=True)
+                r2_model = boto3.client(
+                    "s3",
+                    endpoint_url="https://db62c194342e7bde5f3a192d3879680c.r2.cloudflarestorage.com",
+                    aws_access_key_id="0d24cbc72ed92460208b48ac016fa264",
+                    aws_secret_access_key="a312c485489cbf320ee6ecc3e1c5b5cd17c7f06765637f93e6c49d1831b3d133",
+                    config=BotoConfig(region_name="auto"),
+                )
+                for key in ["RIFE_HDv3.py", "IFNet_HDv3.py", "refine.py", "flownet.pkl"]:
+                    r2_model.download_file("blur-renders", f"models/rife/train_log/{key}", os.path.join(weights_dir, key))
+                    print(f"  Downloaded {key}")
+            else:
+                print("Model weights already cached locally.")
+
+            sys.path.insert(0, weights_dir)
             from RIFE_HDv3 import Model as RIFEModel
 
             print("Loading RIFE v4.25 model...")
             model = RIFEModel()
-            model.load_model("/workspace/RIFE/train_log", -1)
+            model.load_model(weights_dir, -1)
             model.eval()
             model.device()
             print(f"RIFE model loaded on {DEVICE}.")
