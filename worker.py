@@ -183,7 +183,6 @@ def handler(event: dict) -> dict:
             sys.path.insert(0, "/workspace/RIFE")
 
             # Download model weights from R2 if not present
-            import os
             weights_dir = "/workspace/RIFE/train_log"
             if not os.path.exists(os.path.join(weights_dir, "flownet.pkl")):
                 print("Downloading RIFE model weights from R2...")
