@@ -145,14 +145,20 @@ def handler(event: dict) -> dict:
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
+                # Input 0: raw video from stdin
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "-s", f"{w}x{h}",
                 "-r", str(interpolated_fps),
                 "-i", "-",
+                # Input 1: source video (for audio track)
+                "-i", video_path,
+                # Video: filter + encode
                 "-vf", filter_str,
                 "-c:v", vcodec, "-crf", str(quality),
                 "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                # Audio: copy from source (if present)
+                "-c:a", "aac", "-b:a", "192k", "-map", "1:a?",
                 "-movflags", "+faststart",
                 output_path
             ]
