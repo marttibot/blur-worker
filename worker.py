@@ -102,7 +102,7 @@ def handler(event: dict) -> dict:
 
             # Use interpolation multiplier but cap interpolated FPS at 120
             # Higher than 120 doesn't improve perceived blur quality but kills performance
-            max_interp_fps = 120
+            max_interp_fps = 150
             actual_multiplier = min(multiplier, max(1, int(max_interp_fps / source_fps)))
             interpolated_fps = source_fps * actual_multiplier
 
