@@ -100,14 +100,15 @@ def handler(event: dict) -> dict:
             height = int(video_stream["height"])
             h, w = height, width
 
-            # Use full interpolation multiplier (output FPS handled by ffmpeg fps filter)
-            actual_multiplier = multiplier
+            # Use interpolation multiplier but cap interpolated FPS at 120
+            # Higher than 120 doesn't improve perceived blur quality but kills performance
+            max_interp_fps = 120
+            actual_multiplier = min(multiplier, max(1, int(max_interp_fps / source_fps)))
             interpolated_fps = source_fps * actual_multiplier
 
-            # tmix blend frames: ratio of interpolated to output FPS * blur_amount
-            # E.g., 150fps interp / 60fps output * 1.2 blur = 3 blend frames
+            # tmix blend frames: cap at 4 for performance
             ratio = interpolated_fps / target_output_fps
-            blend_frames = max(2, round(ratio * blur_amount))
+            blend_frames = min(4, max(2, round(ratio * blur_amount)))
 
             print(f"Source: {w}x{h} @ {source_fps:.2f}fps")
             print(f"Interpolation: {actual_multiplier}x → {interpolated_fps:.0f}fps")
