@@ -6,8 +6,8 @@ Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
 Pipeline (matches teknos blur v2.42):
   1. Decode source frames (one at a time, memory-efficient)
   2. Deduplicate: skip interpolation on near-identical consecutive frames
-  3. RIFE interpolate → stream raw frames to ffmpeg at interpolated FPS
-  4. ffmpeg applies: tmix motion blur → fps=60 output → color filters → encode
+  3. RIFE interpolate → stream ALL frames at interpolated FPS to ffmpeg
+  4. ffmpeg: tmix motion blur → fps=60 downsample → eq color filters → h265 encode
   5. Upload direct to R2 via S3 API
 """
 
@@ -75,10 +75,7 @@ def handler(event: dict) -> dict:
         codec = str(config.get("codec", "h265")).lower()
 
         # Target output FPS (teknos blur default: 60)
-        try:
-            target_output_fps = int(config.get("outputFps", 60))
-        except (ValueError, TypeError):
-            target_output_fps = 60
+        target_output_fps = 60
 
         work_dir = tempfile.mkdtemp()
 
@@ -103,27 +100,31 @@ def handler(event: dict) -> dict:
             height = int(video_stream["height"])
             h, w = height, width
 
-            # Interpolated FPS (full multiplier)
-            interpolated_fps = source_fps * multiplier
+            # Cap interpolation so output doesn't exceed 60fps
+            actual_multiplier = min(multiplier, math.ceil(target_output_fps / source_fps))
+            interpolated_fps = source_fps * actual_multiplier
 
-            # Blend frames for tmix — keep it small for performance
-            # At target output FPS, blend_frames = ceil(ratio) where ratio = interp/target
-            # But cap at 3-4 to keep ffmpeg fast
+            # tmix blend frames: ratio of interpolated to output FPS * blur_amount
+            # E.g., 150fps interp / 60fps output * 1.2 blur = 3 blend frames
             ratio = interpolated_fps / target_output_fps
             blend_frames = max(2, round(ratio * blur_amount))
 
             print(f"Source: {w}x{h} @ {source_fps:.2f}fps")
-            print(f"Interpolation: {multiplier}x → {interpolated_fps:.0f}fps")
-            print(f"Blur: amount={blur_amount}, blend_frames={blend_frames}, output={target_output_fps}fps")
-            print(f"Codec: {codec}, CRF: {quality}")
+            print(f"Interpolation: {actual_multiplier}x → {interpolated_fps:.0f}fps")
+            print(f"Blur: amount={blur_amount}, blend_frames={blend_frames}")
+            print(f"Output: {target_output_fps}fps, codec={codec}, crf={quality}")
 
             # ===== Build ffmpeg filter chain =====
-            # Since we output at target FPS directly (not interpolated), no need for fps filter
+            # Order: tmix (subtle blend at high fps) → fps=60 (downsample) → eq (color)
             filters = []
 
             if blur_amount > 0:
                 weights = " ".join(["1"] * blend_frames)
                 filters.append(f"tmix=frames={blend_frames}:weights='{weights}'")
+
+            # Downsample to target output FPS
+            if interpolated_fps > target_output_fps:
+                filters.append(f"fps={target_output_fps}")
 
             # Color filters
             eq_parts = []
@@ -147,7 +148,7 @@ def handler(event: dict) -> dict:
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "-s", f"{w}x{h}",
-                "-r", str(target_output_fps),
+                "-r", str(interpolated_fps),
                 "-i", "-",
                 "-vf", filter_str,
                 "-c:v", vcodec, "-crf", str(quality),
@@ -193,79 +194,67 @@ def handler(event: dict) -> dict:
             def pad_image(img):
                 return F.pad(img, padding)
 
-            # ===== Stream: decode → dedup → interpolate → select target fps frames → pipe to ffmpeg =====
+            # ===== Stream: decode → dedup → interpolate ALL frames → pipe to ffmpeg =====
             cap = cv2.VideoCapture(video_path)
             prev_frame = None
             frame_idx = 0
             frames_written = 0
             dedup_skipped = 0
 
-            # Frame selection: from interpolated frames, pick every Nth to hit target FPS
-            # interp_fps / target_fps = frames to skip between selections
-            frames_per_output = interpolated_fps / target_output_fps
-            interp_counter = 0  # counts total interpolated frames produced
-            next_output_at = 0  # which interp frame index to output next
-
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # Check if this source frame maps to an output frame
-                should_output = (interp_counter >= next_output_at)
-
-                if should_output:
-                    try:
-                        proc.stdin.write(frame.tobytes())
-                    except BrokenPipeError:
-                        print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}")
-                        break
-                    frames_written += 1
-                    next_output_at += frames_per_output
-
-                interp_counter += 1
+                # Write source frame (BGR) to ffmpeg
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}")
+                    break
+                frames_written += 1
 
                 if prev_frame is not None:
-                    # Dedup check
+                    # Dedup check: mean absolute difference
                     diff = np.abs(prev_frame.astype(np.float32) - frame.astype(np.float32)).mean()
 
                     if diff > 1.5:
-                        # Interpolate between prev and current
-                        img0 = torch.from_numpy(prev_frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                        img1 = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                        # Frames are different — interpolate
+                        # Convert BGR (cv2) to RGB for RIFE
+                        img0_rgb = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB)
+                        img1_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                        img0 = torch.from_numpy(img0_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                        img1 = torch.from_numpy(img1_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
                         img0 = pad_image(img0).to(DEVICE)
                         img1 = pad_image(img1).to(DEVICE)
 
                         with torch.no_grad():
-                            for j in range(1, multiplier):
-                                t = j / multiplier
+                            for j in range(1, actual_multiplier):
+                                t = j / actual_multiplier
                                 mid = model.inference(img0, img1, timestep=t, scale=1.0)
+                                # RIFE outputs RGB, convert to BGR for ffmpeg
                                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-
-                                interp_counter += 1
-                                if interp_counter >= next_output_at:
-                                    try:
-                                        proc.stdin.write(mid_bgr.tobytes())
-                                    except BrokenPipeError:
-                                        break
-                                    frames_written += 1
-                                    next_output_at += frames_per_output
+                                try:
+                                    proc.stdin.write(mid_bgr.tobytes())
+                                except BrokenPipeError:
+                                    print("[ERROR] ffmpeg stdin broken during interpolation")
+                                    break
+                                frames_written += 1
 
                         del img0, img1
                     else:
-                        # Dedup: repeat current frame
+                        # Frames too similar — repeat current frame (dedup)
                         dedup_skipped += 1
-                        for _ in range(1, multiplier):
-                            interp_counter += 1
-                            if interp_counter >= next_output_at:
-                                try:
-                                    proc.stdin.write(frame.tobytes())
-                                except BrokenPipeError:
-                                    break
-                                frames_written += 1
-                                next_output_at += frames_per_output
+                        for _ in range(1, actual_multiplier):
+                            try:
+                                proc.stdin.write(frame.tobytes())
+                            except BrokenPipeError:
+                                break
+                            frames_written += 1
 
+                    # Free GPU memory periodically
                     if frame_idx % 30 == 0:
                         torch.cuda.empty_cache()
 
