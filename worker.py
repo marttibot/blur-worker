@@ -6,9 +6,11 @@ Uses Practical-RIFE v4.25 with RIFE_HDv3 model.
 Pipeline (matches teknos blur v2.42):
   1. Decode source frames (one at a time, memory-efficient)
   2. Deduplicate: skip interpolation on near-identical consecutive frames
-  3. RIFE interpolate → stream ALL frames at interpolated FPS to ffmpeg
-  4. ffmpeg: tmix motion blur → fps=60 downsample → eq color filters → h265 encode
+  3. RIFE interpolate → write raw frames to tmpfs file (RAM disk)
+  4. ffmpeg reads raw file: tmix motion blur → fps=60 downsample → eq → h265 encode
   5. Upload direct to R2 via S3 API
+
+Uses tmpfs instead of stdin pipe to avoid bottleneck on large/high-fps videos.
 """
 
 import os
@@ -100,23 +102,30 @@ def handler(event: dict) -> dict:
             height = int(video_stream["height"])
             h, w = height, width
 
-            # Use interpolation multiplier but cap interpolated FPS at 120
-            # Higher than 120 doesn't improve perceived blur quality but kills performance
-            max_interp_fps = 150
-            actual_multiplier = min(multiplier, max(1, int(max_interp_fps / source_fps)))
+            # Full interpolation multiplier (no cap)
+            actual_multiplier = multiplier
             interpolated_fps = source_fps * actual_multiplier
 
-            # tmix blend frames: cap at 4 for performance
+            # tmix blend frames: ratio of interpolated to output FPS * blur_amount
+            # Cap at 5 to keep ffmpeg memory reasonable
             ratio = interpolated_fps / target_output_fps
-            blend_frames = min(4, max(2, round(ratio * blur_amount)))
+            blend_frames = min(5, max(2, round(ratio * blur_amount)))
 
-            print(f"Source: {w}x{h} @ {source_fps:.2f}fps")
-            print(f"Interpolation: {actual_multiplier}x → {interpolated_fps:.0f}fps")
+            # Estimate total interpolated frames
+            total_source_frames = int(duration * source_fps)
+            total_interp_frames = total_source_frames * actual_multiplier
+            frame_bytes = w * h * 3  # bgr24
+
+            print(f"Source: {w}x{h} @ {source_fps:.2f}fps ({total_source_frames} frames)")
+            print(f"Interpolation: {actual_multiplier}x → {interpolated_fps:.0f}fps ({total_interp_frames} frames)")
+            print(f"Raw buffer: {total_interp_frames * frame_bytes / 1024 / 1024 / 1024:.1f} GB")
             print(f"Blur: amount={blur_amount}, blend_frames={blend_frames}")
             print(f"Output: {target_output_fps}fps, codec={codec}, crf={quality}")
 
+            if total_interp_frames * frame_bytes > 8 * 1024**3:
+                print(f"[WARN] Raw buffer > 8GB, may be tight on GPU memory")
+
             # ===== Build ffmpeg filter chain =====
-            # Order: tmix (subtle blend at high fps) → fps=60 (downsample) → eq (color)
             filters = []
 
             if blur_amount > 0:
@@ -140,47 +149,16 @@ def handler(event: dict) -> dict:
 
             filter_str = ",".join(filters) if filters else "null"
 
-            # ===== Start ffmpeg encoder =====
-            output_path = os.path.join(work_dir, "output.mp4")
-            vcodec = "libx265" if codec == "h265" else "libx264"
+            # ===== Create tmpfs raw file for frame buffer =====
+            raw_path = os.path.join(work_dir, "frames.raw")
+            raw_size = total_interp_frames * frame_bytes
+            print(f"Allocating raw buffer: {raw_path} ({raw_size / 1024 / 1024:.0f} MB)")
 
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                # Input 0: raw video from stdin
-                "-f", "rawvideo",
-                "-pix_fmt", "bgr24",
-                "-s", f"{w}x{h}",
-                "-r", str(interpolated_fps),
-                "-i", "-",
-                # Input 1: source video (for audio track)
-                "-i", video_path,
-                # Video: filter + encode
-                "-vf", filter_str,
-                "-c:v", vcodec, "-crf", str(quality),
-                "-pix_fmt", "yuv420p", "-preset", "veryfast",
-                # Audio: copy from source (if present)
-                "-map", "0:v",
-                "-map", "1:a?",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                output_path
-            ]
-
-            print(f"ffmpeg: {' '.join(ffmpeg_cmd)}")
-            proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            # Thread to capture ffmpeg stderr for debugging
-            stderr_lines = []
-            def read_stderr():
-                for line in proc.stderr:
-                    stderr_lines.append(line.decode(errors='replace').strip())
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stderr_thread.start()
+            # Pre-allocate the file (zeros) — written to RAM via /tmp (tmpfs on RunPod)
+            with open(raw_path, "wb") as f:
+                if raw_size > 0:
+                    f.seek(raw_size - 1)
+                    f.write(b"\x00")
 
             # ===== Load RIFE model =====
             sys.path.insert(0, "/workspace/RIFE")
@@ -222,24 +200,22 @@ def handler(event: dict) -> dict:
             def pad_image(img):
                 return F.pad(img, padding)
 
-            # ===== Stream: decode → dedup → interpolate ALL frames → pipe to ffmpeg =====
+            # ===== Phase 1: Decode → Dedup → Interpolate → Write raw frames to file =====
+            print(f"[Phase 1] Interpolating frames...")
             cap = cv2.VideoCapture(video_path)
             prev_frame = None
             frame_idx = 0
             frames_written = 0
             dedup_skipped = 0
+            raw_file = open(raw_path, "r+b")
 
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # Write source frame (BGR) to ffmpeg
-                try:
-                    proc.stdin.write(frame.tobytes())
-                except BrokenPipeError:
-                    print(f"[ERROR] ffmpeg stdin broken at frame {frame_idx}")
-                    break
+                # Write source frame (BGR) to raw file
+                raw_file.write(frame.tobytes())
                 frames_written += 1
 
                 if prev_frame is not None:
@@ -261,14 +237,10 @@ def handler(event: dict) -> dict:
                             for j in range(1, actual_multiplier):
                                 t = j / actual_multiplier
                                 mid = model.inference(img0, img1, timestep=t, scale=1.0)
-                                # RIFE outputs RGB, convert to BGR for ffmpeg
+                                # RIFE outputs RGB, convert to BGR
                                 mid_np = (mid[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
                                 mid_bgr = cv2.cvtColor(mid_np, cv2.COLOR_RGB2BGR)
-                                try:
-                                    proc.stdin.write(mid_bgr.tobytes())
-                                except BrokenPipeError:
-                                    print("[ERROR] ffmpeg stdin broken during interpolation")
-                                    break
+                                raw_file.write(mid_bgr.tobytes())
                                 frames_written += 1
 
                         del img0, img1
@@ -276,10 +248,7 @@ def handler(event: dict) -> dict:
                         # Frames too similar — repeat current frame (dedup)
                         dedup_skipped += 1
                         for _ in range(1, actual_multiplier):
-                            try:
-                                proc.stdin.write(frame.tobytes())
-                            except BrokenPipeError:
-                                break
+                            raw_file.write(frame.tobytes())
                             frames_written += 1
 
                     # Free GPU memory periodically
@@ -289,17 +258,60 @@ def handler(event: dict) -> dict:
                 prev_frame = frame
                 frame_idx += 1
 
-                if frame_idx % 30 == 0:
-                    est_total = int(duration * source_fps)
+                if frame_idx % 60 == 0:
+                    est_total = total_source_frames
                     pct = frame_idx / est_total * 100
-                    print(f"Progress: {frame_idx}/{est_total} src ({pct:.0f}%), "
-                          f"{frames_written} out, {dedup_skipped} deduped")
+                    elapsed = frame_idx / source_fps if source_fps > 0 else 0
+                    print(f"  [{pct:.0f}%] {frame_idx}/{est_total} src, {frames_written} interp, {dedup_skipped} deduped")
 
             cap.release()
-            try:
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
+            raw_file.close()
+
+            actual_raw_size = frames_written * frame_bytes
+            print(f"[Phase 1] Done: {frames_written} frames written ({actual_raw_size / 1024 / 1024:.0f} MB), {dedup_skipped} pairs deduped")
+
+            # ===== Phase 2: ffmpeg reads raw file → tmix → fps=60 → eq → encode =====
+            print(f"[Phase 2] Encoding with ffmpeg...")
+            output_path = os.path.join(work_dir, "output.mp4")
+            vcodec = "libx265" if codec == "h265" else "libx264"
+
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                # Input 0: raw video from file
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{w}x{h}",
+                "-r", str(interpolated_fps),
+                "-i", raw_path,
+                # Input 1: source video (for audio track)
+                "-i", video_path,
+                # Video: filter + encode
+                "-vf", filter_str,
+                "-c:v", vcodec, "-crf", str(quality),
+                "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                # Audio: copy from source (if present)
+                "-map", "0:v",
+                "-map", "1:a?",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                output_path
+            ]
+
+            print(f"ffmpeg: {' '.join(ffmpeg_cmd)}")
+            proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # Thread to capture ffmpeg stderr for debugging
+            stderr_lines = []
+            def read_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line.decode(errors='replace').strip())
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
             proc.wait(timeout=300)
             stderr_thread.join(timeout=5)
 
@@ -307,7 +319,7 @@ def handler(event: dict) -> dict:
                 err_output = "\n".join(stderr_lines[-20:])
                 raise ValueError(f"ffmpeg failed (code {proc.returncode}): {err_output}")
 
-            print(f"Encoding complete: {frames_written} frames piped, {dedup_skipped} pairs deduped")
+            print(f"[Phase 2] Encoding complete")
 
             # ===== Upload to R2 =====
             file_size = os.path.getsize(output_path)
